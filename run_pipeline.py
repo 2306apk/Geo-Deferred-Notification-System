@@ -83,7 +83,6 @@ def main():
         )
         vehicle_file.write_text(json.dumps(vehicle_data))
     else:
-        import json
         vehicle_data = json.loads(vehicle_file.read_text())
         print(f"[Pipeline] Phase 2 cached — {sum(len(v) for v in vehicle_data.values())} timesteps")
 
@@ -101,7 +100,6 @@ def main():
         )
         signal_file.write_text(json.dumps(signal_data))
     else:
-        import json
         signal_data = json.loads(signal_file.read_text())
         print(f"[Pipeline] Phase 3 cached")
 
@@ -116,7 +114,6 @@ def main():
         )
         kalman_file.write_text(json.dumps(kalman_data))
     else:
-        import json
         kalman_data = json.loads(kalman_file.read_text())
         print(f"[Pipeline] Phase 4 cached")
 

@@ -91,6 +91,9 @@ def simulate_vehicle(route_name: str, route_data: Dict, dt: float = 1.0,
     seg_covered  = 0.0
     stop_timer   = 0            # seconds remaining in current stop
 
+    # Safety bound in case route data is malformed or advancement stalls.
+    max_steps = max(10_000, int(total_dist / max(dt, 1e-6)) * 10)
+
     while seg_idx < n - 1:
         lat = coords[seg_idx, 0]
         lon = coords[seg_idx, 1]
@@ -137,11 +140,17 @@ def simulate_vehicle(route_name: str, route_data: Dict, dt: float = 1.0,
         if not stopped:
             dist_step   = speed * dt
             seg_covered += dist_step
-            while seg_covered >= seg_dist[seg_idx] and seg_idx < n - 2:
+            # Move across as many segments as covered, including the final one.
+            while seg_idx < n - 1 and seg_covered >= seg_dist[seg_idx]:
                 seg_covered -= seg_dist[seg_idx]
                 seg_idx     += 1
 
         t += dt
+
+        if len(timesteps) >= max_steps:
+            print(f"[Vehicle] Warning: step cap reached on {route_name}; "
+                  "stopping early to avoid runaway memory usage.")
+            break
 
         if seg_idx >= n - 1:
             break
