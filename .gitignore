@@ -1,0 +1,17 @@
+.venv/
+pycache/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+db/*.db
+models/*.pkl
+data/vehicle_data.json
+data/signal_data.json
+data/kalman_data.json
+data/towers.json
+data/graph.pkl
+.pytest_cache/
+.mypy_cache/
+.vscode/

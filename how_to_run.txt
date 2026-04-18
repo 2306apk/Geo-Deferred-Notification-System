@@ -1,0 +1,24 @@
+Suggested run order (Windows PowerShell)
+
+Environment setup
+cd C:/Users/shrey/OneDrive/Documents/Hackathon/smart_notify
+py -3.11 -m venv .venv
+./.venv/Scripts/Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+First baseline run (fast/reliable)
+python run_pipeline.py --skip-osmnx
+Optional realism run (if network is stable)
+python run_pipeline.py --force
+
+Start API
+cd api
+uvicorn main:app --reload --port 8000
+
+Start simulation
+Open http://localhost:8000/docs
+Use POST /simulate/start with:
+route: city_route
+speed_factor: 15
+notif_rate: 4
