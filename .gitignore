@@ -30,3 +30,10 @@ data/graph.pkl
 # Generated pipeline outputs (keep source routes tracked)
 data/*.json
 !data/routes.json
+# Local secrets
+.env.local
+.env
+.env.*
+!.env.example
+# Generated reports
+artifacts/
