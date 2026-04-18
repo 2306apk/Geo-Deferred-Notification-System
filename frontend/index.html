@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RouteForge</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <aside class="sidebar glass">
+        <div class="sidebar-top">
+          <div class="sidebar-collapse">«</div>
+        </div>
+        <h2>Controls</h2>
+
+        <div class="section-label">Simulation Controls</div>
+        <button id="advanceBtn" class="action-btn">🛣️ Advance Car</button>
+        <button id="resetBtn" class="action-btn secondary">↩ Reset Trip</button>
+
+        <div class="section-label">Add Notification</div>
+        <label class="field-label" for="mapStyleSelect">Map Style</label>
+        <select id="mapStyleSelect" class="input">
+          <option value="satellite" selected>satellite</option>
+          <option value="dark">dark</option>
+          <option value="schematic">schematic</option>
+        </select>
+        <div id="mapProviderHint" class="provider-hint">Provider: fallback satellite</div>
+
+        <label class="field-label" for="messageInput">Message</label>
+        <input id="messageInput" class="input" value="Test notification" />
+
+        <label class="field-label" for="prioritySelect">Priority</label>
+        <select id="prioritySelect" class="input">
+          <option value="urgent">urgent</option>
+          <option value="deferred">deferred</option>
+        </select>
+
+        <button id="queueBtn" class="action-btn">Queue</button>
+
+        <div class="status-card glass">
+          <div class="status-title">📍 Trip Status</div>
+          <div class="status-list">
+            <div><span class="dot good"></span><span id="statusCoords">-</span></div>
+            <div><span class="dot bad"></span><span id="statusSpeed">-</span></div>
+            <div><span class="dot warn"></span><span id="statusCoverage">-</span></div>
+            <div><span class="dot blue"></span><span id="statusPending">-</span></div>
+            <div><span class="dot mint"></span><span id="statusDelivered">-</span></div>
+          </div>
+          <div id="statusDecision" class="decision-pill">Waiting for model</div>
+        </div>
+      </aside>
+
+      <main class="main-content">
+        <section class="hero glass">
+          <div class="hero-left">
+            <div class="brand-row">
+              <div class="brand-mark">🛣️</div>
+              <div>
+                <h1>RouteForge</h1>
+                <p>Smart notifications delivered only when network is stable and driver is not distracted.</p>
+              </div>
+            </div>
+          </div>
+          <button class="create-app">+ CREATE APP</button>
+        </section>
+
+        <section class="metrics">
+          <div class="metric glass">
+            <div class="metric-label">Current Coverage</div>
+            <div id="metricCoverage" class="metric-value">-</div>
+            <div id="metricRsrp" class="metric-sub">-</div>
+          </div>
+          <div class="metric glass">
+            <div class="metric-label">Model Confidence</div>
+            <div id="metricConfidence" class="metric-value">-</div>
+            <div id="metricDecision" class="metric-sub">-</div>
+            <div id="metricProbability" class="metric-sub">-</div>
+          </div>
+          <div class="metric glass">
+            <div class="metric-label">Distraction Risk</div>
+            <div id="metricDistraction" class="metric-value">-</div>
+            <div class="metric-sub">Lower is safer</div>
+          </div>
+          <div class="metric glass">
+            <div class="metric-label">Pending Queue</div>
+            <div id="metricPending" class="metric-value">-</div>
+            <div id="metricDelivered" class="metric-sub">-</div>
+          </div>
+          <div class="metric glass">
+            <div class="metric-label">Vehicle Speed</div>
+            <div id="metricSpeed" class="metric-value">-</div>
+            <div id="metricSinr" class="metric-sub">-</div>
+          </div>
+        </section>
+
+        <section class="content-grid">
+          <section class="map-panel">
+            <div class="panel-header glass">
+              <h3>🗺️ Live Trip Map</h3>
+            </div>
+            <div class="glass map-frame">
+              <div id="map"></div>
+              <div class="map-legend-overlay">
+                <div class="legend-row"><span class="legend-dot good"></span> Good Coverage</div>
+                <div class="legend-row"><span class="legend-dot bad"></span> Poor Coverage</div>
+                <div class="legend-row"><span class="legend-dot blue"></span> Delivered</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="notif-panel">
+            <div class="panel-header glass">
+              <h3>💬 Notifications</h3>
+            </div>
+
+            <div class="notif-section">
+              <h4>⌛ Pending</h4>
+              <div id="pendingList" class="notif-list"></div>
+            </div>
+
+            <div class="notif-section">
+              <h4>✅ Delivered</h4>
+              <div id="deliveredList" class="notif-list"></div>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
+    <script src="/config.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
