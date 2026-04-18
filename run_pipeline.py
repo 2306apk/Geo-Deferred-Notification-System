@@ -14,6 +14,7 @@ Usage:
   python run_pipeline.py                  # full pipeline
   python run_pipeline.py --skip-osmnx    # use synthetic routes
   python run_pipeline.py --skip-training  # only data, no ML
+    python run_pipeline.py --use-opencellid # fetch real towers if key is set
 """
 
 import sys
@@ -41,6 +42,31 @@ def run_phase(name: str, fn, *args, **kwargs):
     return result
 
 
+def _bounds_from_routes(routes: dict, pad_deg: float = 0.01) -> dict:
+    """Build a compact bbox from all route waypoints."""
+    lats = []
+    lons = []
+    for _, r in routes.items():
+        for lat, lon in r.get("waypoints", []):
+            lats.append(float(lat))
+            lons.append(float(lon))
+
+    if not lats or not lons:
+        return {
+            "lat_min": 12.85,
+            "lat_max": 13.15,
+            "lon_min": 77.45,
+            "lon_max": 77.80,
+        }
+
+    return {
+        "lat_min": min(lats) - pad_deg,
+        "lat_max": max(lats) + pad_deg,
+        "lon_min": min(lons) - pad_deg,
+        "lon_max": max(lons) + pad_deg,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-osmnx",    action="store_true",
@@ -49,6 +75,10 @@ def main():
                         help="Skip ML model training (use existing models)")
     parser.add_argument("--force",         action="store_true",
                         help="Force re-run even if cached files exist")
+    parser.add_argument("--use-opencellid", action="store_true",
+                        help="Use OpenCelliD towers in Phase 3 if API key exists")
+    parser.add_argument("--opencellid-key", type=str, default=None,
+                        help="Override OpenCelliD API key (else uses OPENCELLID_API_KEY)")
     args = parser.parse_args()
 
     banner("SMART NOTIFY — DATA & TRAINING PIPELINE")
@@ -91,7 +121,17 @@ def main():
     tower_file  = data_dir / "towers.json"
     if not signal_file.exists() or args.force:
         from data.signal_simulator import generate_towers, simulate_signals_all
-        towers = run_phase("Phase 3a: Tower Generation", generate_towers, n=300)
+        tower_bounds = _bounds_from_routes(routes)
+        print(f"[Pipeline] Phase 3 bounds: {tower_bounds}")
+        towers = run_phase(
+            "Phase 3a: Tower Generation",
+            generate_towers,
+            n=300,
+            use_opencellid=args.use_opencellid,
+            api_key=args.opencellid_key,
+            force_refresh=args.force,
+            bounds=tower_bounds,
+        )
         tower_file.write_text(json.dumps(towers))
         signal_data = run_phase(
             "Phase 3b: Signal Simulation",
