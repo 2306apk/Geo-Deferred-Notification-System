@@ -15,9 +15,9 @@ import json
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -44,12 +44,16 @@ app.add_middleware(
 # ── Shared simulation state ────────────────────────────────────────────────
 
 class SimState:
-    active_route:   str   = "city_route"
-    speed_factor:   float = 15.0
-    running:        bool  = False
-    latest_frame:   Optional[Dict] = None
-    injected_notifs: list = []
-    connected_ws:   list  = []   # list of WebSocket objects
+    def __init__(self):
+        self.active_route: str = "city_route"
+        self.speed_factor: float = 15.0
+        self.running: bool = False
+        self.latest_frame: Optional[Dict] = None
+        self.injected_notifs: List[Dict[str, Any]] = []
+        self.connected_ws: List[WebSocket] = []
+        self.session_id: Optional[str] = None
+        self.task: Optional[asyncio.Task] = None
+        self.lock = asyncio.Lock()
 
 sim = SimState()
 
@@ -65,6 +69,7 @@ async def root():
         "service":  "Smart Notify",
         "sim_running": sim.running,
         "route":    sim.active_route,
+        "session_id": sim.session_id,
     }
 
 
@@ -91,21 +96,50 @@ class SimStartRequest(BaseModel):
 
 
 @app.post("/simulate/start")
-async def start_simulation(req: SimStartRequest, bg: BackgroundTasks):
+async def start_simulation(req: SimStartRequest):
     """Start or restart the simulation loop."""
-    sim.active_route = req.route
-    sim.speed_factor = req.speed_factor
-    sim.running      = True
-    sim.injected_notifs = []
+    restarted = False
+    async with sim.lock:
+        if sim.task and not sim.task.done():
+            restarted = True
+            sim.running = False
+            sim.task.cancel()
+            try:
+                await sim.task
+            except asyncio.CancelledError:
+                pass
 
-    bg.add_task(_run_sim_task, req.route, req.speed_factor, req.notif_rate)
-    return {"status": "started", "route": req.route, "speed_factor": req.speed_factor}
+        sim.active_route = req.route
+        sim.speed_factor = req.speed_factor
+        sim.running = True
+        sim.injected_notifs = []
+        sim.latest_frame = None
+        sim.session_id = str(uuid.uuid4())[:8]
+        sim.task = asyncio.create_task(
+            _run_sim_task(sim.session_id, req.route, req.speed_factor, req.notif_rate)
+        )
+
+    return {
+        "status": "restarted" if restarted else "started",
+        "route": req.route,
+        "speed_factor": req.speed_factor,
+        "session_id": sim.session_id,
+    }
 
 
 @app.post("/simulate/stop")
 async def stop_simulation():
-    sim.running = False
-    return {"status": "stopped"}
+    async with sim.lock:
+        sim.running = False
+        if sim.task and not sim.task.done():
+            sim.task.cancel()
+            try:
+                await sim.task
+            except asyncio.CancelledError:
+                pass
+        sim.task = None
+
+    return {"status": "stopped", "session_id": sim.session_id}
 
 
 class NotifyRequest(BaseModel):
@@ -195,27 +229,18 @@ async def ws_simulation(ws: WebSocket):
 
     try:
         while True:
-            # Receive any client messages (non-blocking)
-            try:
-                data = await asyncio.wait_for(ws.receive_text(), timeout=0.05)
-                msg  = json.loads(data)
-                if msg.get("type") == "notify":
-                    sim.injected_notifs.append({
-                        "id":       str(uuid.uuid4())[:8],
-                        "message":  msg.get("message", "Client notification"),
-                        "priority": msg.get("priority", 5),
-                    })
-            except asyncio.TimeoutError:
-                pass
-
-            # Push latest frame if available
-            if sim.latest_frame:
-                await ws.send_text(json.dumps(sim.latest_frame))
-
-            await asyncio.sleep(0.1)
+            data = await ws.receive_text()
+            msg = json.loads(data)
+            if msg.get("type") == "notify":
+                sim.injected_notifs.append({
+                    "id":       str(uuid.uuid4())[:8],
+                    "message":  msg.get("message", "Client notification"),
+                    "priority": msg.get("priority", 5),
+                })
 
     except WebSocketDisconnect:
-        sim.connected_ws.remove(ws)
+        if ws in sim.connected_ws:
+            sim.connected_ws.remove(ws)
         print(f"[WS] Client disconnected. Remaining: {len(sim.connected_ws)}")
 
 
@@ -223,24 +248,21 @@ async def ws_simulation(ws: WebSocket):
 # BACKGROUND SIMULATION TASK
 # ══════════════════════════════════════════════════════════════════
 
-async def _run_sim_task(route: str, speed_factor: float, notif_rate: float):
+async def _run_sim_task(session_id: str, route: str, speed_factor: float, notif_rate: float):
     """
     Runs the simulation and pushes frames to all connected WS clients.
     Handles injected notifications from /notify endpoint.
     """
-    print(f"[Task] Simulation starting: {route}")
+    print(f"[Task] Simulation starting: {route} (session={session_id})")
     try:
-        from engine.decision_engine import DecisionEngine, EngineConfig
-        from signal_processing.kalman_filter import SignalKalmanFilter
-        import numpy as np
-
-        # We re-implement a thin wrapper here so we can inject external notifs
         init_db()
 
         async for frame in run_simulation(route, speed_factor, notif_rate=notif_rate):
             if not sim.running:
                 print("[Task] Simulation stopped by user.")
                 break
+
+            frame["session_id"] = session_id
 
             # Handle injected notifications
             while sim.injected_notifs:
@@ -273,6 +295,8 @@ async def _run_sim_task(route: str, speed_factor: float, notif_rate: float):
         traceback.print_exc()
     finally:
         sim.running = False
+        if sim.task and sim.task is asyncio.current_task():
+            sim.task = None
         print("[Task] Simulation ended.")
 
 

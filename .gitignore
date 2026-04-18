@@ -21,10 +21,19 @@ env/
 Thumbs.db
 .vscode/
 
+# Local secrets
+.env
+.env.*
+!.env.example
+secrets.local.json
+*.secret
+*.secrets.json
+
 # Generated project artifacts
 cache/
 db/*.db
 models/*.pkl
+artifacts/
 data/graph.pkl
 
 # Generated pipeline outputs (keep source routes tracked)

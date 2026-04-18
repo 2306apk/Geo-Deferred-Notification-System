@@ -30,6 +30,14 @@ log = logging.getLogger("decision_engine")
 
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
+FEATURE_ORDER = [
+    "mean_rssi_w", "std_rssi_w", "trend_mean_w",
+    "range_rssi_w",
+    "speed", "stopped",
+    "time_since_good", "good_frac_w", "rssi_slope_w",
+    "delta_rssi", "rolling_slope_w", "signal_var_w", "time_since_last_drop",
+]
+
 # ── Config ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -50,6 +58,11 @@ class EngineConfig:
 
     # Window for real-time features
     feature_window:        int   = 5
+
+    # Heuristic fallback thresholds (used when ML models are unavailable)
+    fallback_send_quality: float = 0.55
+    fallback_send_quality_trend: float = 0.35
+    fallback_wait_deadzone_age_frac: float = 0.7
 
 
 class Decision(str, Enum):
@@ -91,6 +104,7 @@ class DeliveryEvent:
 class ModelBundle:
     def __init__(self, models_dir: Path = MODELS_DIR):
         self.ready = False
+        self.mode  = "heuristic"
         self._load(models_dir)
 
     def _load(self, d: Path):
@@ -105,9 +119,14 @@ class ModelBundle:
             self.if_scaler     = _pkl("if_scaler")
             self.feature_cols  = _pkl("feature_cols")
             self.ready         = True
+            self.mode          = "ml"
             log.info("Models loaded successfully.")
         except FileNotFoundError as e:
             log.warning(f"Models not found ({e}). Running without ML.")
+        except Exception as e:
+            log.warning(f"Model load failed ({e}). Running without ML.")
+        if not hasattr(self, "feature_cols"):
+            self.feature_cols = list(FEATURE_ORDER)
 
     def predict_gb(self, feat: np.ndarray) -> float:
         """Returns P(good signal ahead)."""
@@ -140,43 +159,55 @@ class SignalBuffer:
         self._trend    : List[float] = []
         self._t        : List[float] = []
         self.last_good_t = -9999.0
+        self.last_drop_t = -9999.0
+        self._prev_good: Optional[bool] = None
 
     def push(self, rssi_filtered: float, trend: float, t: float):
+        is_good = rssi_filtered >= self.good_rssi
+        if self._prev_good is True and not is_good:
+            self.last_drop_t = t
+        self._prev_good = is_good
+
         self._rssi.append(rssi_filtered)
         self._trend.append(trend)
         self._t.append(t)
-        if rssi_filtered >= self.good_rssi:
+        if is_good:
             self.last_good_t = t
         if len(self._rssi) > self.window:
             self._rssi.pop(0)
             self._trend.pop(0)
             self._t.pop(0)
 
-    def build_features(self, speed: float, in_dead_zone: bool,
-                        stopped: bool, t: float) -> np.ndarray:
+    def build_feature_map(self, speed: float, in_dead_zone: bool,
+                          stopped: bool, t: float) -> Dict[str, float]:
         r = np.array(self._rssi) if self._rssi else np.array([-100.0])
         tr = np.array(self._trend) if self._trend else np.array([0.0])
 
         time_since_good = t - self.last_good_t
+        time_since_last_drop = t - self.last_drop_t
         if len(r) >= 2:
             slope = float(np.polyfit(np.arange(len(r)), r, 1)[0])
+            delta_rssi = float(r[-1] - r[-2])
         else:
             slope = 0.0
+            delta_rssi = 0.0
 
-        return np.array([
-            r.mean(),                         # mean_rssi_w
-            r.std(),                          # std_rssi_w
-            tr.mean(),                        # trend_mean_w
-            r.min(),                          # min_rssi_w
-            r.max(),                          # max_rssi_w
-            r.max() - r.min(),                # range_rssi_w
-            speed,                            # speed
-            float(in_dead_zone),              # in_dead_zone
-            float(stopped),                   # stopped
-            float(np.clip(time_since_good, 0, 300)),  # time_since_good
-            float(np.mean(r >= self.good_rssi)),       # good_frac_w
-            slope,                            # rssi_slope_w
-        ])
+        return {
+            "mean_rssi_w": float(r.mean()),
+            "std_rssi_w": float(r.std()),
+            "trend_mean_w": float(tr.mean()),
+            "range_rssi_w": float(r.max() - r.min()),
+            "speed": float(speed),
+            "in_dead_zone": float(in_dead_zone),
+            "stopped": float(stopped),
+            "time_since_good": float(np.clip(time_since_good, 0, 300)),
+            "good_frac_w": float(np.mean(r >= self.good_rssi)),
+            "rssi_slope_w": float(slope),
+            "rolling_slope_w": float(slope),
+            "delta_rssi": float(delta_rssi),
+            "signal_var_w": float(np.var(r)),
+            "time_since_last_drop": float(np.clip(time_since_last_drop, 0, 300)),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -221,7 +252,6 @@ class DecisionEngine:
     def decide(self, notif: Notification) -> Tuple[Decision, str]:
         sensor = self._current
         t      = sensor["t"]
-        rssi   = sensor["rssi_filtered"]
         qual   = sensor["signal_quality_filtered"]
         age    = t - notif.created_at
         urgent = notif.priority <= 2
@@ -231,13 +261,19 @@ class DecisionEngine:
             if age >= self.cfg.urgent_timeout_sec or qual >= 0.3:
                 return Decision.SEND_URGENT, f"urgent priority={notif.priority}"
 
+        # If ML artifacts are unavailable, use resilient heuristics.
+        if not self.models.ready:
+            return self._decide_without_ml(notif)
+
         # 2. Build features for ML
-        feat = self.buffer.build_features(
+        feat_map = self.buffer.build_feature_map(
             speed        = sensor["speed"],
             in_dead_zone = sensor["in_dead_zone"],
             stopped      = sensor["stopped"],
             t            = t,
         )
+        feat_cols = self.models.feature_cols if self.models.feature_cols else FEATURE_ORDER
+        feat = np.array([feat_map.get(c, 0.0) for c in feat_cols], dtype=float)
 
         is_anomaly, if_score = self.models.predict_if(feat)
         p_good_ahead         = self.models.predict_gb(feat)
@@ -267,6 +303,40 @@ class DecisionEngine:
         # 7. DEFAULT — keep queuing
         return Decision.QUEUE, \
             f"holding (q={qual:.2f}, p_ahead={p_good_ahead:.2f}, age={age:.0f}s)"
+
+    def _decide_without_ml(self, notif: Notification) -> Tuple[Decision, str]:
+        """Heuristic fallback used when trained models are unavailable."""
+        sensor = self._current
+        t = sensor["t"]
+        qual = sensor["signal_quality_filtered"]
+        age = t - notif.created_at
+        in_dead_zone = bool(sensor.get("in_dead_zone", False))
+        trend = float(sensor.get("rssi_trend", 0.0))
+        urgent = notif.priority <= 2
+
+        if urgent and (age >= self.cfg.urgent_timeout_sec or qual >= 0.30):
+            return Decision.SEND_URGENT, "heuristic urgent policy"
+
+        if age >= self.cfg.max_queue_age_sec:
+            return Decision.SEND_TIMEOUT, f"heuristic timeout ({age:.0f}s)"
+
+        if qual >= self.cfg.fallback_send_quality:
+            return Decision.SEND_NOW, (
+                f"heuristic send: quality={qual:.2f} >= {self.cfg.fallback_send_quality:.2f}"
+            )
+
+        if (not in_dead_zone and trend > 0.25
+                and qual >= self.cfg.fallback_send_quality_trend):
+            return Decision.SEND_NOW, (
+                f"heuristic send: improving trend={trend:.2f}, quality={qual:.2f}"
+            )
+
+        if in_dead_zone and age < self.cfg.max_queue_age_sec * self.cfg.fallback_wait_deadzone_age_frac:
+            return Decision.WAIT_BETTER, "heuristic wait in dead-zone"
+
+        return Decision.QUEUE, (
+            f"heuristic hold (q={qual:.2f}, trend={trend:.2f}, age={age:.0f}s)"
+        )
 
     # ── Queue management ──────────────────────────────────────────────────
     def add_notification(self, notif: Notification):
@@ -338,6 +408,7 @@ class DecisionEngine:
         return {
             "metrics":      self.metrics,
             "queue_size":   len(self.queue),
+            "model_mode":   self.models.mode,
             "current_rssi": sensor.get("rssi_filtered"),
             "current_quality": sensor.get("signal_quality_filtered"),
             "in_dead_zone": sensor.get("in_dead_zone"),
