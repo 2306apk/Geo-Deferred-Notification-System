@@ -304,6 +304,10 @@ class NotificationManager:
                 enriched["queue_age_seconds"] = age
             except Exception:
                 enriched["queue_age_seconds"] = 0.0
+            # 🔥 TIMEOUT SAFETY (prevents infinite queue)
+            if enriched["queue_age_seconds"] > 15:
+                decision = "SEND_TIMEOUT"
+                reason = "timeout_fallback"
 
             speed = float(frame.get("speed", 0.0) or 0.0)
             try:
@@ -319,6 +323,11 @@ class NotificationManager:
             signal_1 = int(frame.get("signal_1", signal) or signal)
             signal_2 = int(frame.get("signal_2", signal_1) or signal_1)
             signal_fluct = (abs(signal - signal_1) + abs(signal_1 - signal_2)) >= 2
+            # 🔥 STABILITY CHECK
+            if signal_fluct:
+                enriched["unstable_signal"] = True
+            else:
+                enriched["unstable_signal"] = False
             handover = int(frame.get("handover", 0) or 0)
             distraction_risk = compute_distraction_risk(speed, accel, handover, signal_fluct)
 
