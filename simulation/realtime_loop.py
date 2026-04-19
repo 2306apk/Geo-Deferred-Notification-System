@@ -74,6 +74,19 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            run_id          TEXT,
+            notif_id        TEXT,
+            created_t       REAL,
+            created_rssi    REAL,
+            created_quality REAL,
+            created_in_dead_zone INTEGER,
+            priority        INTEGER,
+            source          TEXT
+        )
+    """)
+
     conn.commit()
     conn.close()
     print(f"[DB] Initialised at {DB_PATH}")
@@ -95,6 +108,25 @@ def log_delivery(conn: sqlite3.Connection, run_id: str, ev):
         INSERT INTO deliveries VALUES (?,?,?,?,?,?,?,?)
     """, (run_id, ev.notif_id, ev.decision, ev.timestamp,
           ev.rssi, ev.quality, ev.wait_sec, ev.reason))
+
+
+def log_notification(conn: sqlite3.Connection, run_id: str,
+                     notif: Notification, step: Dict[str, Any], source: str = "generated"):
+    conn.execute(
+        """
+        INSERT INTO notifications VALUES (?,?,?,?,?,?,?,?)
+        """,
+        (
+            run_id,
+            notif.id,
+            float(step["t"]),
+            float(step.get("rssi_filtered", step.get("rssi_raw", -120.0))),
+            float(step.get("signal_quality_filtered", step.get("signal_quality", 0.0))),
+            int(step.get("in_dead_zone", False)),
+            int(notif.priority),
+            str(source),
+        ),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -120,18 +152,57 @@ class MockNotificationStream:
         ("Promotional offer - 20% off", 10),
     ]
 
+    LOW_PRIORITY_PAYLOADS = [
+        ("Delivery arriving in 10min", 4),
+        ("Your cab is 3 stops away", 4),
+        ("Flash sale started!", 8),
+        ("News: Traffic jam on ORR", 6),
+        ("Reminder: Meeting at 3pm", 5),
+        ("Weather alert: Rain expected", 5),
+        ("Promotional offer - 20% off", 10),
+    ]
+
     def __init__(self, rate_per_min: float = 4.0, seed: int = 7):
         self.rng          = np.random.default_rng(seed)
         self.interval_sec = 60.0 / rate_per_min
         self._next_t      = 0.0
+        self._last_emit_t = -9999.0
+        self._boost_cooldown_sec = 6.0
+        self._deadzone_drop_quality = 0.22
+        self._deadzone_drop_prob = 0.75
 
-    def tick(self, t: float) -> Optional[Notification]:
+    def tick(self, t: float, quality: float = 1.0,
+             in_dead_zone: bool = False, trend: float = 0.0) -> Optional[Notification]:
         """Returns a new notification if it's time, else None."""
-        if t >= self._next_t:
+        due_by_schedule = t >= self._next_t
+
+        is_poor_window = (quality < 0.58) or in_dead_zone or (trend < -0.25)
+        due_by_boost = (
+            is_poor_window
+            and (t - self._last_emit_t) >= self._boost_cooldown_sec
+            and self.rng.random() < 0.10
+        )
+
+        if due_by_schedule or due_by_boost:
             self._next_t = t + self.rng.exponential(self.interval_sec)
-            msg, priority = self.PAYLOADS[
-                self.rng.integers(len(self.PAYLOADS))
-            ]
+            self._last_emit_t = t
+
+            if due_by_boost:
+                msg, priority = self.LOW_PRIORITY_PAYLOADS[
+                    self.rng.integers(len(self.LOW_PRIORITY_PAYLOADS))
+                ]
+            else:
+                msg, priority = self.PAYLOADS[
+                    self.rng.integers(len(self.PAYLOADS))
+                ]
+
+            # In severe dead-zones, suppress most non-urgent traffic so queueing
+            # focuses on high-value notifications that can realistically improve.
+            if (in_dead_zone and quality <= self._deadzone_drop_quality
+                and int(priority) > 2
+                and self.rng.random() < self._deadzone_drop_prob):
+                return None
+
             return Notification(
                 id       = str(uuid.uuid4())[:8],
                 payload  = {"message": msg},
@@ -220,9 +291,15 @@ async def run_simulation(
         engine.ingest(step)
 
         # ── Possibly generate new notification ──────────────────────────────
-        notif = notif_gen.tick(step["t"])
+        notif = notif_gen.tick(
+            step["t"],
+            quality=float(step.get("signal_quality_filtered", step.get("signal_quality", 1.0))),
+            in_dead_zone=bool(step.get("in_dead_zone", False)),
+            trend=float(step.get("rssi_trend", 0.0)),
+        )
         if notif:
             engine.add_notification(notif)
+            log_notification(conn, run_id, notif, step, source="generated")
 
         # ── Process queue → get delivery events ───────────────────────────
         events = engine.process_queue()

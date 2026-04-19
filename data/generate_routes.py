@@ -52,6 +52,20 @@ FALLBACK_ROUTES = {
         ],
         "route_type": "tunnel",
     },
+    "mixed_route": {
+        "description": "City -> Highway -> Tunnel corridor (mixed mobility + mixed coverage)",
+        "waypoints": [
+            # city-like segment
+            (12.9716, 77.5946), (12.9740, 77.5920), (12.9790, 77.5903),
+            # highway-like segment
+            (12.9900, 77.5888), (13.0100, 77.5877), (13.0300, 77.5877),
+            (13.0500, 77.5877),
+            # transition to tunnel-style zone
+            (13.0200, 77.6200), (12.9950, 77.6550), (12.9800, 77.6850),
+            (12.9720, 77.7050), (12.9698, 77.7250), (12.9698, 77.7499),
+        ],
+        "route_type": "mixed",
+    },
 }
 
 # Signal quality profile per route segment (index → quality 0-1)
@@ -61,7 +75,24 @@ ROUTE_SIGNAL_PROFILES = {
     "tunnel_route":  [0.75, 0.70, 0.65, 0.55, 0.45, 0.30,
                       0.15, 0.10, 0.08, 0.12, 0.20, 0.35,   # tunnel zone
                       0.55, 0.70, 0.80],
+    "mixed_route":   [
+        0.72, 0.75, 0.78,   # city start
+        0.88, 0.92, 0.95, 0.93,  # highway middle
+        0.70, 0.52, 0.30, 0.16, 0.22, 0.45  # tunnel-style tail
+    ],
 }
+
+
+def _path_via_nodes(G, via_points, ox, nx):
+    """Build one route by chaining shortest paths through intermediate waypoints."""
+    node_seq = [ox.nearest_nodes(G, lon, lat) for (lat, lon) in via_points]
+    full_path = []
+    for i in range(len(node_seq) - 1):
+        seg = nx.shortest_path(G, node_seq[i], node_seq[i + 1], weight="length")
+        if i > 0:
+            seg = seg[1:]
+        full_path.extend(seg)
+    return full_path
 
 
 def try_osmnx_routes(city: str = "Bangalore, India"):
@@ -82,6 +113,16 @@ def try_osmnx_routes(city: str = "Bangalore, India"):
         "tunnel_route":  ((12.9716, 77.5946), (12.9698, 77.7499)),
     }
 
+    via_routes = {
+        "mixed_route": [
+            (12.9716, 77.5946),  # city center
+            (12.9950, 77.5880),  # highway join
+            (13.0500, 77.5877),  # highway stretch
+            (12.9950, 77.6550),  # transition
+            (12.9698, 77.7499),  # tunnel-side tail
+        ]
+    }
+
     routes = {}
     for name, (orig, dest) in endpoints.items():
         orig_node = ox.nearest_nodes(G, orig[1], orig[0])
@@ -92,6 +133,14 @@ def try_osmnx_routes(city: str = "Bangalore, India"):
         info["waypoints"] = coords
         routes[name] = info
         print(f"[OSMnx] {name}: {len(coords)} nodes")
+
+    for name, via_points in via_routes.items():
+        path = _path_via_nodes(G, via_points, ox, nx)
+        coords = [(G.nodes[n]["y"], G.nodes[n]["x"]) for n in path]
+        info = FALLBACK_ROUTES[name].copy()
+        info["waypoints"] = coords
+        routes[name] = info
+        print(f"[OSMnx] {name}: {len(coords)} nodes (via {len(via_points)} anchors)")
 
     return G, routes
 

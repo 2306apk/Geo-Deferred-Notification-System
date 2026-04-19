@@ -50,6 +50,7 @@ class EngineConfig:
     gb_send_prob_min:      float = 0.65     # min P(good signal ahead) to send
     gb_wait_prob:          float = 0.70     # wait if future prob is THIS good
     anomaly_score_cutoff:  float = -0.1     # IF decision_function < this → anomaly
+    low_priority_min:      int   = 6        # priorities >= this are data-saving biased
 
     # Timing
     max_queue_age_sec:     float = 60.0     # force-send after this wait
@@ -231,6 +232,29 @@ class DecisionEngine:
             "avg_rssi_at_send": 0.0,
         }
 
+    def _priority_adjustments(self, priority: int) -> Dict[str, float]:
+        """Return per-priority thresholds to bias non-urgent traffic toward better signal."""
+        if priority <= 2:
+            return {
+                "send_quality_min": self.cfg.stable_quality_min,
+                "send_prob_min": self.cfg.gb_send_prob_min,
+                "wait_prob": self.cfg.gb_wait_prob,
+                "max_wait_frac": 0.60,
+            }
+        if priority <= 5:
+            return {
+                "send_quality_min": min(self.cfg.stable_quality_min + 0.05, 0.90),
+                "send_prob_min": min(self.cfg.gb_send_prob_min + 0.05, 0.95),
+                "wait_prob": min(self.cfg.gb_wait_prob + 0.05, 0.95),
+                "max_wait_frac": 0.68,
+            }
+        return {
+            "send_quality_min": min(self.cfg.stable_quality_min + 0.12, 0.95),
+            "send_prob_min": min(self.cfg.gb_send_prob_min + 0.12, 0.98),
+            "wait_prob": min(self.cfg.gb_wait_prob + 0.10, 0.98),
+            "max_wait_frac": 0.72,
+        }
+
     # ── Ingest sensor tick ────────────────────────────────────────────────
     def ingest(self, sensor: Dict[str, Any]):
         """
@@ -255,6 +279,7 @@ class DecisionEngine:
         qual   = sensor["signal_quality_filtered"]
         age    = t - notif.created_at
         urgent = notif.priority <= 2
+        pri = self._priority_adjustments(notif.priority)
 
         # 1. URGENT — send immediately (with tiny grace)
         if urgent:
@@ -278,22 +303,62 @@ class DecisionEngine:
         is_anomaly, if_score = self.models.predict_if(feat)
         p_good_ahead         = self.models.predict_gb(feat)
 
+        age_frac = float(np.clip(age / max(self.cfg.max_queue_age_sec, 1e-6), 0.0, 1.0))
+        in_dead_zone = bool(sensor.get("in_dead_zone", False))
+        rssi_trend = float(sensor.get("rssi_trend", 0.0))
+        route_name = str(sensor.get("route", ""))
+        route_stress = route_name in {"mixed_route", "highway_route"}
+
+        # As notifications age, relax strict thresholds to reduce forced timeout sends.
+        send_quality_target = max(
+            self.cfg.stable_quality_min - 0.10,
+            pri["send_quality_min"] - 0.20 * age_frac,
+        )
+        send_prob_target = max(
+            0.45,
+            pri["send_prob_min"] - 0.25 * age_frac,
+        )
+        wait_prob_target = max(
+            0.55,
+            pri["wait_prob"] - 0.20 * age_frac,
+        )
+
         # 3. ANOMALY — signal unstable, don't waste bandwidth
-        if is_anomaly and age < self.cfg.max_queue_age_sec * 0.8:
+        if is_anomaly and age < self.cfg.max_queue_age_sec * 0.80:
             return Decision.WAIT_ANOMALY, \
                 f"anomaly detected (if_score={if_score:.3f})"
 
         # 4. ML says BETTER signal is coming — hold on
-        if (p_good_ahead >= self.cfg.gb_wait_prob
-                and age < self.cfg.max_queue_age_sec * 0.6):
+        if (p_good_ahead >= wait_prob_target
+            and age < self.cfg.max_queue_age_sec * pri["max_wait_frac"]
+            and (not in_dead_zone or age_frac < 0.45)):
             return Decision.WAIT_BETTER, \
                 f"ML predicts better signal ahead (p={p_good_ahead:.2f})"
 
         # 5. STABLE + GOOD signal right now — send
-        if (qual >= self.cfg.stable_quality_min
-                and p_good_ahead >= self.cfg.gb_send_prob_min):
+        if (qual >= send_quality_target
+            and p_good_ahead >= send_prob_target):
             return Decision.SEND_NOW, \
-                f"signal good (q={qual:.2f}, p_ahead={p_good_ahead:.2f})"
+            f"signal good (q={qual:.2f}, p_ahead={p_good_ahead:.2f}, pri={notif.priority}, age={age:.0f}s)"
+
+        if route_stress and notif.priority > 2 and age_frac >= 0.45 and qual >= 0.12:
+            return Decision.SEND_NOW, \
+                f"route-stress early flush (q={qual:.2f}, p_ahead={p_good_ahead:.2f}, age={age:.0f}s)"
+
+        # Pre-timeout flush: for non-urgent notifications with poor improvement outlook,
+        # send before hard timeout to reduce timeout-rate while still allowing early defer.
+        if (notif.priority > 2 and age_frac >= 0.62
+            and (in_dead_zone or p_good_ahead < 0.50 or rssi_trend <= 0.05)
+            and qual >= 0.25):
+            return Decision.SEND_NOW, \
+                f"pre-timeout flush (q={qual:.2f}, p_ahead={p_good_ahead:.2f}, trend={rssi_trend:.2f}, age={age:.0f}s)"
+
+        # Late-queue relief for non-urgent traffic: avoid hitting hard timeout while
+        # still requiring minimally viable link conditions.
+        if (notif.priority > 2 and age_frac >= 0.75
+            and qual >= 0.30 and p_good_ahead >= 0.40):
+            return Decision.SEND_NOW, \
+                f"late-queue relief (q={qual:.2f}, p_ahead={p_good_ahead:.2f}, age={age:.0f}s)"
 
         # 6. TIMEOUT — waited too long, force send
         if age >= self.cfg.max_queue_age_sec:

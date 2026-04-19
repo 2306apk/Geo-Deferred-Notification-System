@@ -20,6 +20,7 @@ SPEED_PROFILES = {
     "city":    {"mean": 8.0,  "std": 3.0, "stop_prob": 0.08, "stop_dur": (5, 30)},
     "highway": {"mean": 22.0, "std": 4.0, "stop_prob": 0.01, "stop_dur": (2, 8)},
     "tunnel":  {"mean": 12.0, "std": 5.0, "stop_prob": 0.05, "stop_dur": (3, 20)},
+    "mixed":   {"mean": 14.0, "std": 7.0, "stop_prob": 0.04, "stop_dur": (3, 18)},
 }
 
 EARTH_RADIUS_M = 6_371_000.0

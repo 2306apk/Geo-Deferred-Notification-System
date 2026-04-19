@@ -380,9 +380,10 @@ def add_signal_to_timesteps(timesteps: List[Dict],
 
     # Route-aware attenuation for offline synthetic realism.
     base_env_loss = {
-        "city_route": 11.0,
-        "highway_route": 18.0,
-        "tunnel_route": 22.0,
+        "city_route": 9.0,
+        "highway_route": 8.5,
+        "tunnel_route": 16.0,
+        "mixed_route": 8.0,
     }.get(route_name, 12.0)
 
     # Deterministic outage windows create stronger transition supervision.
@@ -390,17 +391,25 @@ def add_signal_to_timesteps(timesteps: List[Dict],
     rng_outage = np.random.default_rng(seed + 10_000)
     outage_windows = []
     outage_count = {
-        "city_route": 3,
-        "highway_route": 2,
-        "tunnel_route": 4,
+        "city_route": 2,
+        "highway_route": 1,
+        "tunnel_route": 3,
+        "mixed_route": 1,
     }.get(route_name, 2)
+    outage_depth_ranges = {
+        "city_route": (6.0, 14.0),
+        "highway_route": (3.0, 7.0),
+        "tunnel_route": (7.0, 15.0),
+        "mixed_route": (2.5, 6.0),
+    }
+    outage_depth_lo, outage_depth_hi = outage_depth_ranges.get(route_name, (10.0, 22.0))
     for _ in range(outage_count):
         if n_steps < 60:
             break
         start = int(rng_outage.integers(low=20, high=max(21, n_steps - 40)))
         duration = int(rng_outage.integers(low=18, high=70))
         end = min(n_steps - 1, start + duration)
-        depth = float(rng_outage.uniform(10.0, 22.0))
+        depth = float(rng_outage.uniform(outage_depth_lo, outage_depth_hi))
         outage_windows.append((start, end, depth))
 
     # Time-correlated signal state to create realistic good<->bad transitions.
@@ -418,7 +427,10 @@ def add_signal_to_timesteps(timesteps: List[Dict],
         # Dead zone override
         dead = in_dead_zone(lat, lon)
         if dead:
-            rssi = float(rng.uniform(-115, -105))
+            if route_name in {"highway_route", "mixed_route"}:
+                rssi = float(rng.uniform(-96, -84))
+            else:
+                rssi = float(rng.uniform(-108, -96))
 
         # Correlated shadowing (slow drift) improves temporal continuity.
         shadow_db = 0.90 * shadow_db + float(rng.normal(0.0, 1.6))
@@ -427,10 +439,15 @@ def add_signal_to_timesteps(timesteps: List[Dict],
         speed = float(step.get("speed", 0.0))
         if fade_remaining <= 0:
             fade_p = 0.012 + (0.018 if dead else 0.0) + (0.008 if speed > 8.0 else 0.0)
+            if route_name in {"highway_route", "mixed_route"}:
+                fade_p *= 0.45
             if rng.random() < fade_p:
                 fade_total = int(rng.integers(4, 14))
                 fade_remaining = fade_total
-                fade_depth = float(rng.uniform(8.0, 20.0))
+                if route_name in {"highway_route", "mixed_route"}:
+                    fade_depth = float(rng.uniform(2.0, 5.0))
+                else:
+                    fade_depth = float(rng.uniform(8.0, 20.0))
 
         fade_penalty = 0.0
         if fade_remaining > 0 and fade_total > 0:
@@ -456,8 +473,20 @@ def add_signal_to_timesteps(timesteps: List[Dict],
                 mid = (start + end) / 2.0
                 shape = 1.0 - min(abs(idx - mid) / width, 1.0)
                 outage_penalty += depth * (0.5 + 0.5 * shape)
+        if route_name in {"highway_route", "mixed_route"}:
+            outage_penalty *= 0.20
+
         if outage_penalty > 0.0:
             rssi -= outage_penalty
+
+        # Mixed-route corridor assist: keep tunnel-tail challenging but recoverable.
+        if route_name == "mixed_route" and n_steps > 0:
+            progress = idx / float(n_steps)
+            if 0.55 <= progress <= 0.95:
+                ramp = min((progress - 0.55) / 0.25, 1.0)
+                taper = min((0.95 - progress) / 0.10, 1.0)
+                boost = 12.0 * max(min(ramp, taper), 0.0)
+                rssi += boost
 
         # Gaussian noise  (±3 dB realistic urban)
         rssi += rng.normal(0, 3.0)

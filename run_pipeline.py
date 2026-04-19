@@ -15,6 +15,7 @@ Usage:
   python run_pipeline.py --skip-osmnx    # use synthetic routes
   python run_pipeline.py --skip-training  # only data, no ML
     python run_pipeline.py --use-opencellid # fetch real towers if key is set
+    python run_pipeline.py --opencellid-cache-only # use cached OpenCelliD towers only
 """
 
 import sys
@@ -79,6 +80,8 @@ def main():
                         help="Use OpenCelliD towers in Phase 3 if API key exists")
     parser.add_argument("--opencellid-key", type=str, default=None,
                         help="Override OpenCelliD API key (else uses OPENCELLID_API_KEY)")
+    parser.add_argument("--opencellid-cache-only", action="store_true",
+                        help="Use data/opencellid_towers.json for towers (no live API call)")
     args = parser.parse_args()
 
     banner("SMART NOTIFY — DATA & TRAINING PIPELINE")
@@ -123,15 +126,29 @@ def main():
         from data.signal_simulator import generate_towers, simulate_signals_all
         tower_bounds = _bounds_from_routes(routes)
         print(f"[Pipeline] Phase 3 bounds: {tower_bounds}")
-        towers = run_phase(
-            "Phase 3a: Tower Generation",
-            generate_towers,
-            n=300,
-            use_opencellid=args.use_opencellid,
-            api_key=args.opencellid_key,
-            force_refresh=args.force,
-            bounds=tower_bounds,
-        )
+
+        if args.opencellid_cache_only:
+            cache_file = data_dir / "opencellid_towers.json"
+            if not cache_file.exists():
+                raise FileNotFoundError(
+                    f"OpenCelliD cache not found: {cache_file}. "
+                    "Run once with --use-opencellid (when quota is available)."
+                )
+            towers = json.loads(cache_file.read_text())
+            for t in towers:
+                t["source"] = "opencellid"
+            print(f"[Pipeline] Phase 3a: loaded {len(towers)} towers from OpenCelliD cache")
+        else:
+            towers = run_phase(
+                "Phase 3a: Tower Generation",
+                generate_towers,
+                n=300,
+                use_opencellid=args.use_opencellid,
+                api_key=args.opencellid_key,
+                force_refresh=args.force,
+                bounds=tower_bounds,
+            )
+
         tower_file.write_text(json.dumps(towers))
         signal_data = run_phase(
             "Phase 3b: Signal Simulation",
