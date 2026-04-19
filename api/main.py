@@ -11,23 +11,30 @@ Endpoints:
 """
 
 import asyncio
+import csv
 import json
 import sqlite3
 import uuid
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from simulation.realtime_loop import run_simulation, DB_PATH, init_db
-from engine.decision_engine import DecisionEngine, EngineConfig
+from signal_runtime import SignalPredictor
+
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
+DATASET_PATH = ROOT_DIR / "data" / "dataset.csv"
+ROUTES_PATH = ROOT_DIR / "data" / "routes.json"
+TOWERS_PATH = ROOT_DIR / "data" / "towers.json"
+DB_PATH = BASE_DIR / "smart_notify.db"
 
 app = FastAPI(
     title="Smart Notify API",
@@ -43,27 +50,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Shared simulation state (thread‑safe with asyncio.Lock)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Shared simulation state ────────────────────────────────────────────────
+
 class SimState:
-    def __init__(self):
-        self.active_route: str = "city_route"
-        self.speed_factor: float = 15.0
-        self.running: bool = False
-        self.latest_frame: Optional[Dict] = None
-        self.injected_notifs: List[Dict[str, Any]] = []
-        self.connected_ws: List[WebSocket] = []
-        self.session_id: Optional[str] = None
-        self.task: Optional[asyncio.Task] = None
-        self.lock = asyncio.Lock()
+    active_route:   str   = "city_route"
+    speed_factor:   float = 15.0
+    running:        bool  = False
+    latest_frame:   Optional[Dict] = None
+    injected_notifs: list = []
+    connected_ws:   list  = []   # list of WebSocket objects
+    task: Optional[asyncio.Task] = None
 
 sim = SimState()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SQLite helpers (lightweight, idempotent)
-# ─────────────────────────────────────────────────────────────────────────────
+class PredictRequest(BaseModel):
+    data: dict[str, Any]
+
+
+try:
+    predictor = SignalPredictor(str(BASE_DIR / "signal_model_bundle.pkl"))
+except Exception as exc:
+    predictor = None
+    print(f"[API] Warning: model not loaded yet ({exc})")
+
+
+def init_db() -> None:
+    ensure_db_tables()
+
+
+# ---------- SQLite helpers (lightweight, idempotent) -----------------------
 def ensure_db_tables() -> None:
     """Create required tables if they don't exist. Safe to call repeatedly."""
     try:
@@ -73,8 +89,7 @@ def ensure_db_tables() -> None:
             """
             CREATE TABLE IF NOT EXISTS runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                start_time TEXT,
-                session_id TEXT
+                start_time TEXT
             )
             """
         )
@@ -89,8 +104,7 @@ def ensure_db_tables() -> None:
                 signal INTEGER,
                 distraction_risk REAL,
                 prob_good_signal REAL,
-                decision_threshold REAL,
-                reason TEXT
+                decision_threshold REAL
             )
             """
         )
@@ -109,7 +123,7 @@ def ensure_db_tables() -> None:
         conn.commit()
         conn.close()
     except Exception:
-        # non‑fatal – simulation should continue even if DB unavailable
+        # be non-fatal — simulation should continue even if DB unavailable
         pass
 
     # Ensure additional columns exist for older DBs
@@ -122,25 +136,18 @@ def ensure_db_tables() -> None:
             cur.execute("ALTER TABLE events ADD COLUMN prob_good_signal REAL")
         if "decision_threshold" not in cols:
             cur.execute("ALTER TABLE events ADD COLUMN decision_threshold REAL")
-        if "reason" not in cols:
-            cur.execute("ALTER TABLE events ADD COLUMN reason TEXT")
         conn.commit()
         conn.close()
     except Exception:
         pass
 
 
-def log_event_db(notif_id: str, decision: str, speed: float, signal: int,
-                 distraction_risk: float, prob_good_signal: float | None = None,
-                 decision_threshold: float | None = None, reason: str = "") -> None:
+def log_event_db(notif_id: str, decision: str, speed: float, signal: int, distraction_risk: float, prob_good_signal: float | None = None, decision_threshold: float | None = None) -> None:
     """Insert a single event row into the `events` table."""
     try:
         conn = sqlite3.connect(str(DB_PATH))
         conn.execute(
-            """INSERT INTO events(notif_id, decision, timestamp, speed, signal,
-                                  distraction_risk, prob_good_signal,
-                                  decision_threshold, reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            "INSERT INTO events(notif_id, decision, timestamp, speed, signal, distraction_risk, prob_good_signal, decision_threshold) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 notif_id,
                 decision,
@@ -150,7 +157,6 @@ def log_event_db(notif_id: str, decision: str, speed: float, signal: int,
                 float(distraction_risk),
                 (float(prob_good_signal) if prob_good_signal is not None else None),
                 (float(decision_threshold) if decision_threshold is not None else None),
-                reason,
             ),
         )
         conn.commit()
@@ -159,16 +165,19 @@ def log_event_db(notif_id: str, decision: str, speed: float, signal: int,
         pass
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Safety helpers (acceleration & distraction risk)
-# ─────────────────────────────────────────────────────────────────────────────
+
+# -------------------- Notification manager + safety helpers ------------------
+
 _prev_speed = 0.0
 _prev_time = None
-_acc_history: List[float] = []
+_acc_history: list[float] = []
 
 
 def get_acceleration(speed: float) -> float:
-    """Compute smoothed acceleration (m/s^2) from speed (km/h)."""
+    """Compute smoothed acceleration (m/s^2) from speed (km/h).
+
+    Keeps a tiny history (last 3 values), clamps to [-3, 3].
+    """
     global _prev_speed, _prev_time, _acc_history
     current_time = time.time()
     if _prev_time is None:
@@ -178,6 +187,7 @@ def get_acceleration(speed: float) -> float:
     dt = current_time - _prev_time
     if dt <= 0:
         return _acc_history[-1] if _acc_history else 0.0
+    # convert km/h to m/s
     sp = speed * (1000.0 / 3600.0)
     prev_sp = _prev_speed * (1000.0 / 3600.0)
     acc = (sp - prev_sp) / max(dt, 1e-6)
@@ -191,9 +201,16 @@ def get_acceleration(speed: float) -> float:
     return smoothed
 
 
-def compute_distraction_risk(speed: float, accel: float, handover: int,
-                             signal_fluctuation: bool) -> float:
-    """Compute distraction risk per PART 2 rules."""
+def compute_distraction_risk(speed: float, accel: float, handover: int, signal_fluctuation: bool) -> float:
+    """Compute distraction risk per PART 2 rules.
+
+    - Start at 0
+    - speed > 60 -> +2
+    - accel < -2 -> +2 (sudden braking)
+    - handover == 1 -> +1
+    - signal_fluctuation True -> +1
+    - speed < 5 -> -3
+    """
     risk = 0.0
     if speed > 60:
         risk += 2.0
@@ -208,18 +225,28 @@ def compute_distraction_risk(speed: float, accel: float, handover: int,
     return risk
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Notification Manager (core intelligence from Version 1)
-# ─────────────────────────────────────────────────────────────────────────────
 class NotificationManager:
-    """In‑memory notification queue manager with safety‑aware evaluation."""
+    """In-memory notification queue manager with safety-aware evaluation.
+
+    - keeps pending and delivered lists
+    - soft queue cap and collapse of deferred messages
+    - evaluate_pending(frame, predictor) applies pre-ML safety checks and
+      optionally consults a predictor for 'predicted_good_signal_ahead'
+    """
 
     def __init__(self, soft_cap: int = 8):
-        self.pending: List[dict] = []
-        self.delivered: List[dict] = []
+        self.pending: list[dict] = []
+        self.delivered: list[dict] = []
         self.soft_cap = soft_cap
 
-    def add(self, message: str, priority: int = 5) -> dict:
+    def add(
+        self,
+        message: str,
+        priority: int = 5,
+        notif_id: Optional[str] = None,
+        created_at: Optional[str] = None,
+    ) -> dict:
+        # priority: 1=urgent ... 10=low
         is_urgent = int(priority) <= 3
         # collapse exact duplicate deferred messages
         if not is_urgent:
@@ -229,11 +256,11 @@ class NotificationManager:
                     return p
 
         notif = {
-            "id": str(uuid.uuid4())[:8],
+            "id": notif_id or str(uuid.uuid4())[:8],
             "message": message,
             "priority": priority,
             "urgent": is_urgent,
-            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "created_at": created_at or datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "repeat_count": 1,
         }
 
@@ -258,40 +285,19 @@ class NotificationManager:
         self.pending.append(notif)
         return notif
 
-    def evaluate_pending(self, frame: dict,
-                         predictor: Optional[object] = None) -> List[dict]:
-        """Evaluate pending notifications against the current frame.
-
-        Returns list of delivered notifications (moved from pending to delivered).
-        """
-        delivered_now: List[dict] = []
-        remaining: List[dict] = []
+    def evaluate_pending(self, frame: dict, predictor: Optional[object] = None) -> list[dict]:
+        """Evaluate queued notifications using the trained ML runtime when available."""
+        delivered_now: list[dict] = []
+        remaining: list[dict] = []
         nonurgent_sent = 0
-        MAX_SEND_PER_TICK = 3
+        max_send_per_tick = 3
 
-        def predicted_good(enriched: dict) -> bool:
-            try:
-                if predictor is None:
-                    q = float(enriched.get("quality", 0) or 0)
-                    r = float(enriched.get("rssi", -120) or -120)
-                    return (q >= 0.7) or (r >= -95)
-                if hasattr(predictor, "predict"):
-                    out = predictor.predict(enriched)
-                    prob = (out.get("prob_good_signal") or
-                            out.get("probability") or
-                            out.get("main_model_prob"))
-                    if prob is None:
-                        return False
-                    return float(prob) >= 0.68
-            except Exception:
-                return False
-            return False
-
-        for notif in list(self.pending):
+        for notif in self.pending:
             enriched = {**frame}
-            enriched["urgent"] = notif.get("urgent", False)
+            enriched["urgent"] = bool(notif.get("urgent", False))
             enriched["queue_size"] = len(self.pending)
             enriched["repeated_count"] = notif.get("repeat_count", 1)
+
             try:
                 created = datetime.fromisoformat(notif["created_at"].replace("Z", "+00:00"))
                 age = (datetime.utcnow() - created).total_seconds()
@@ -299,111 +305,103 @@ class NotificationManager:
             except Exception:
                 enriched["queue_age_seconds"] = 0.0
 
-            speed = float(frame.get("speed", 0) or 0)
-            accel = float(frame.get("accel", 0) or 0)
+            speed = float(frame.get("speed", 0.0) or 0.0)
+            try:
+                accel = float(frame.get("accel", 0.0) or 0.0)
+            except Exception:
+                accel = 0.0
             try:
                 accel = get_acceleration(speed)
             except Exception:
                 pass
 
-            s = int(frame.get("signal", 0) or 0)
-            s1 = int(frame.get("signal_1", s) or s)
-            s2 = int(frame.get("signal_2", s1) or s1)
-            signal_fluct = (abs(s - s1) + abs(s1 - s2)) >= 2
-
+            signal = int(frame.get("signal", 0) or 0)
+            signal_1 = int(frame.get("signal_1", signal) or signal)
+            signal_2 = int(frame.get("signal_2", signal_1) or signal_1)
+            signal_fluct = (abs(signal - signal_1) + abs(signal_1 - signal_2)) >= 2
             handover = int(frame.get("handover", 0) or 0)
             distraction_risk = compute_distraction_risk(speed, accel, handover, signal_fluct)
 
-            minimal_ui = False
-            predictor_out = None
+            predictor_out: dict[str, Any] | None = None
             if predictor is not None and hasattr(predictor, "predict"):
                 try:
                     predictor_out = predictor.predict(enriched)
-                    for k in ("prob_good_signal", "main_model_prob", "backup_model_prob",
-                              "legacy_model_prob", "confidence", "anomaly"):
-                        if k in predictor_out:
-                            enriched[k] = predictor_out[k]
                 except Exception:
                     predictor_out = None
 
-            # Decision rules
-            if enriched.get("urgent", False):
-                minimal_ui = True
-                decision = "SEND"
-                reason = "urgent_override"
-            elif predictor_out and bool(predictor_out.get("anomaly", False)):
-                decision = "WAIT_ANOMALY"
-                reason = "anomaly_detected"
-            elif distraction_risk >= 2:
-                decision = "WAIT_DISTRACTION"
-                reason = "driver_distraction"
-            elif accel < -2.0:
-                decision = "WAIT_BRAKE"
-                reason = "sudden_braking_block"
-            elif speed > 60:
-                decision = "WAIT_HIGH_SPEED"
-                reason = "fast_highway_safety"
+            if predictor_out is not None:
+                decision = str(predictor_out.get("decision", "QUEUE"))
+                reason = str(predictor_out.get("reason", "model_decision"))
+                confidence = float(predictor_out.get("confidence", 0.0) or 0.0)
+                probability = float(predictor_out.get("prob_good_signal", 0.0) or 0.0)
+                decision_threshold = float(
+                    predictor_out.get("decision_threshold_used", predictor_out.get("decision_threshold", 0.0)) or 0.0
+                )
+                minimal_ui = bool(predictor_out.get("minimal_ui", False))
+                distraction_risk = float(predictor_out.get("distraction_risk", distraction_risk) or distraction_risk)
+                accel = float(predictor_out.get("acceleration", accel) or accel)
+                main_model_prob = float(predictor_out.get("main_model_prob", 0.0) or 0.0)
+                backup_model_prob = float(predictor_out.get("backup_model_prob", 0.0) or 0.0)
+                legacy_model_prob = float(predictor_out.get("legacy_model_prob", 0.0) or 0.0)
             else:
-                prob = None
-                if predictor_out is not None and "prob_good_signal" in predictor_out:
-                    try:
-                        prob = float(predictor_out.get("prob_good_signal", 0.0) or 0.0)
-                    except Exception:
-                        prob = None
-                if prob is None:
-                    try:
-                        q = float(enriched.get("quality", 0) or 0)
-                        r = float(enriched.get("rssi", -120) or -120)
-                        prob = 1.0 if (q >= 0.7 or r >= -95) else 0.0
-                    except Exception:
-                        prob = 0.0
-
+                probability = 1.0 if int(frame.get("signal", 0) or 0) == 1 else 0.0
                 decision_threshold = 0.6
-                if prob > decision_threshold:
+                main_model_prob = backup_model_prob = legacy_model_prob = 0.0
+                confidence = abs(probability - 0.5) * 2.0
+                minimal_ui = bool(enriched["urgent"])
+                if enriched["urgent"]:
                     decision = "SEND"
-                    reason = "model_confident_good"
-                elif 0.4 <= prob <= decision_threshold:
-                    decision = "WAIT_PREDICTED"
-                    reason = "model_uncertain_wait"
+                    reason = "urgent_override"
+                elif distraction_risk >= 2:
+                    decision = "WAIT_DISTRACTION"
+                    reason = "driver_distraction"
+                elif accel < -2.0:
+                    decision = "WAIT_BRAKE"
+                    reason = "sudden_braking_block"
+                elif speed > 60:
+                    decision = "WAIT_HIGH_SPEED"
+                    reason = "fast_highway_safety"
+                elif probability > decision_threshold:
+                    decision = "SEND"
+                    reason = "heuristic_good_signal"
                 else:
                     decision = "QUEUE"
                     reason = "default_safe_queue"
 
-            # Respect batch caps
-            if decision.startswith("SEND") and (enriched.get("urgent", False) or nonurgent_sent < MAX_SEND_PER_TICK):
+            should_send = decision.startswith("SEND")
+            if should_send and (enriched["urgent"] or nonurgent_sent < max_send_per_tick):
                 delivered = {
                     **notif,
                     "delivered_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "decision": decision,
                     "reason": reason,
-                    "confidence": float(enriched.get("confidence", frame.get("confidence", 0.0) or 0.0)),
-                    "probability": float(enriched.get("prob_good_signal", frame.get("prob_good_signal", 0.0) or 0.0)),
-                    "decision_threshold_used": float(enriched.get("decision_threshold", 0.6)),
-                    "prob_good_signal": float(enriched.get("prob_good_signal", 0.0) or 0.0),
-                    "main_model_prob": float(enriched.get("main_model_prob", 0.0) or 0.0),
-                    "backup_model_prob": float(enriched.get("backup_model_prob", 0.0) or 0.0),
-                    "legacy_model_prob": float(enriched.get("legacy_model_prob", 0.0) or 0.0),
-                    "minimal_ui": bool(minimal_ui),
+                    "confidence": confidence,
+                    "probability": probability,
+                    "decision_threshold_used": decision_threshold,
+                    "prob_good_signal": probability,
+                    "main_model_prob": main_model_prob,
+                    "backup_model_prob": backup_model_prob,
+                    "legacy_model_prob": legacy_model_prob,
+                    "minimal_ui": minimal_ui,
                     "distraction_risk": float(distraction_risk),
                     "acceleration": float(accel),
                 }
                 delivered_now.append(delivered)
                 self.delivered.append(delivered)
+                if not enriched["urgent"]:
+                    nonurgent_sent += 1
                 try:
                     log_event_db(
                         delivered.get("id"),
                         delivered.get("decision"),
                         speed,
-                        int(frame.get("signal", 0) or 0),
+                        signal,
                         delivered.get("distraction_risk", 0.0),
-                        delivered.get("probability"),
-                        delivered.get("decision_threshold_used"),
-                        reason
+                        delivered.get("probability", None),
+                        delivered.get("decision_threshold_used", None),
                     )
                 except Exception:
                     pass
-                if not enriched.get("urgent", False):
-                    nonurgent_sent += 1
             else:
                 remaining.append(notif)
 
@@ -411,34 +409,89 @@ class NotificationManager:
         return delivered_now
 
 
+# manager instance used by the simulation loop
 manager = NotificationManager()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+def _coerce_row_types(row: dict[str, str]) -> dict[str, Any]:
+    numeric_fields = {
+        "t", "lat", "lon", "speed", "speed_kmh", "accel", "signal", "signal_1", "signal_2",
+        "signal_delta", "rsrp", "sinr", "rsrp_dbm", "sinr_db", "rsrq_db", "rssi_raw",
+        "signal_quality", "signal_slope", "signal_variance", "handover", "handover_rate",
+        "time_since_last_good", "distance_since_last_good_m", "time_in_bad_signal",
+        "distance_in_bad_signal_m", "rsrp_kalman", "sinr_kalman", "rsrp_mean_5", "rsrp_std_5",
+        "sinr_mean_5", "rsrp_slope", "future_good_ratio", "future_mean_rsrp", "label",
+        "label_stable", "tower_distance_m",
+    }
+    int_like_fields = {
+        "signal", "signal_1", "signal_2", "handover", "handover_rate", "is_fluctuating",
+        "is_fast", "is_braking", "time_since_last_good", "time_in_bad_signal", "label", "label_stable",
+    }
+    converted: dict[str, Any] = {}
+    for key, value in row.items():
+        if value in (None, ""):
+            converted[key] = None
+            continue
+        if key in numeric_fields:
+            try:
+                num = float(value)
+                converted[key] = int(num) if key in int_like_fields else num
+                continue
+            except Exception:
+                pass
+        if value in {"True", "False"}:
+            converted[key] = value == "True"
+        else:
+            converted[key] = value
+    return converted
+
+
+def _load_dataset_rows(route: str) -> list[dict[str, Any]]:
+    if not DATASET_PATH.exists():
+        raise HTTPException(404, f"Dataset not found: {DATASET_PATH}")
+
+    with DATASET_PATH.open("r", encoding="utf-8") as fh:
+        rows = [_coerce_row_types(r) for r in csv.DictReader(fh)]
+
+    if route and route not in {"all", "*"}:
+        filtered = [row for row in rows if str(row.get("route", "")) == route]
+        if filtered:
+            return filtered
+    return rows
+
+
+
+# ══════════════════════════════════════════════════════════════════
 # REST ENDPOINTS
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 
 @app.get("/")
 async def root():
     return {
-        "status": "ok",
-        "service": "Smart Notify",
+        "status":   "ok",
+        "service":  "Smart Notify",
         "sim_running": sim.running,
-        "route": sim.active_route,
-        "session_id": sim.session_id,
+        "route":    sim.active_route,
+        "model_loaded": predictor is not None,
     }
+
+
+@app.post("/predict")
+async def predict_signal(req: PredictRequest):
+    if predictor is None:
+        raise HTTPException(503, "Model bundle not loaded. Train the model first.")
+    return predictor.predict(req.data)
 
 
 @app.get("/routes")
 async def get_routes():
-    routes_file = Path(__file__).parent.parent / "data" / "routes.json"
-    if not routes_file.exists():
+    if not ROUTES_PATH.exists():
         raise HTTPException(404, "Routes not generated yet. Run pipeline first.")
-    routes = json.loads(routes_file.read_text())
+    routes = json.loads(ROUTES_PATH.read_text())
     return {
         name: {
             "description": r.get("description", ""),
-            "route_type": r.get("route_type", ""),
+            "route_type":  r.get("route_type", ""),
             "num_waypoints": len(r.get("waypoints", [])),
         }
         for name, r in routes.items()
@@ -446,73 +499,61 @@ async def get_routes():
 
 
 class SimStartRequest(BaseModel):
-    route: str = "city_route"
+    route:        str   = "city_route"
     speed_factor: float = 15.0
-    notif_rate: float = 4.0
+    notif_rate:   float = 4.0
 
 
 @app.post("/simulate/start")
-async def start_simulation(req: SimStartRequest):
+async def start_simulation(req: SimStartRequest, bg: BackgroundTasks):
     """Start or restart the simulation loop."""
-    restarted = False
-    async with sim.lock:
-        if sim.task and not sim.task.done():
-            restarted = True
-            sim.running = False
-            sim.task.cancel()
-            try:
-                await sim.task
-            except asyncio.CancelledError:
-                pass
+    if sim.task and not sim.task.done():
+        sim.running = False
+        sim.task.cancel()
+        try:
+            await sim.task
+        except Exception:
+            pass
 
-        sim.active_route = req.route
-        sim.speed_factor = req.speed_factor
-        sim.running = True
-        sim.injected_notifs = []
-        sim.latest_frame = None
-        sim.session_id = str(uuid.uuid4())[:8]
-        sim.task = asyncio.create_task(
-            _run_sim_task(sim.session_id, req.route, req.speed_factor, req.notif_rate)
-        )
-
-    return {
-        "status": "restarted" if restarted else "started",
-        "route": req.route,
-        "speed_factor": req.speed_factor,
-        "session_id": sim.session_id,
-    }
+    sim.active_route = req.route
+    sim.speed_factor = req.speed_factor
+    sim.running      = True
+    sim.injected_notifs = []
+    sim.task = asyncio.create_task(_run_sim_task(req.route, req.speed_factor, req.notif_rate))
+    # Log run start in DB (non-blocking)
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.execute("INSERT INTO runs(start_time) VALUES(?)", (datetime.utcnow().isoformat(timespec="seconds") + "Z",))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    return {"status": "started", "route": req.route, "speed_factor": req.speed_factor}
 
 
 @app.post("/simulate/stop")
 async def stop_simulation():
-    async with sim.lock:
-        sim.running = False
-        if sim.task and not sim.task.done():
-            sim.task.cancel()
-            try:
-                await sim.task
-            except asyncio.CancelledError:
-                pass
-        sim.task = None
-
-    return {"status": "stopped", "session_id": sim.session_id}
+    sim.running = False
+    if sim.task and not sim.task.done():
+        sim.task.cancel()
+        try:
+            await sim.task
+        except Exception:
+            pass
+    sim.task = None
+    return {"status": "stopped"}
 
 
 class NotifyRequest(BaseModel):
-    message: str
-    priority: int = 5  # 1=urgent ... 10=low
+    message:  str
+    priority: int = 5   # 1=urgent ... 10=low
 
 
 @app.post("/notify")
 async def inject_notification(req: NotifyRequest):
     """Inject a notification into the engine during live simulation."""
-    notif = {
-        "id": str(uuid.uuid4())[:8],
-        "message": req.message,
-        "priority": req.priority,
-    }
-    sim.injected_notifs.append(notif)
-    return {"status": "queued", "notif_id": notif["id"]}
+    notif = manager.add(req.message, priority=req.priority)
+    return {"status": "queued", "notif": notif}
 
 
 @app.get("/metrics")
@@ -522,28 +563,24 @@ async def get_metrics():
         return {"error": "No data yet. Run a simulation first."}
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    # recent runs (from our `runs` table)
+    runs = conn.execute("SELECT * FROM runs ORDER BY start_time DESC LIMIT 5").fetchall()
 
-    runs = conn.execute(
-        "SELECT * FROM runs ORDER BY start_time DESC LIMIT 5"
-    ).fetchall()
-
+    # aggregated counts by decision from events
     deliveries = conn.execute(
         "SELECT decision, COUNT(*) as cnt FROM events GROUP BY decision"
     ).fetchall()
 
-    total_sent = conn.execute(
-        "SELECT COUNT(*) FROM events WHERE decision LIKE 'SEND%'"
-    ).fetchone()[0]
-    total_queued = conn.execute(
-        "SELECT COUNT(*) FROM events WHERE decision = 'QUEUE'"
-    ).fetchone()[0]
+    # simple metrics summary
+    total_sent = conn.execute("SELECT COUNT(*) as cnt FROM events WHERE decision LIKE 'SEND%'").fetchone()[0]
+    total_queued = conn.execute("SELECT COUNT(*) as cnt FROM events WHERE decision = 'QUEUE'").fetchone()[0]
     delivery_rate = float(total_sent) / float(max(1, total_sent + total_queued))
 
+    # persist a snapshot into metrics table (lightweight)
     try:
         conn.execute(
             "INSERT INTO metrics(created_at, delivery_rate, avg_delay, total_sent, total_queued) VALUES (?, ?, ?, ?, ?)",
-            (datetime.utcnow().isoformat(timespec="seconds") + "Z",
-             delivery_rate, None, int(total_sent), int(total_queued)),
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z", delivery_rate, None, int(total_sent), int(total_queued)),
         )
         conn.commit()
     except Exception:
@@ -580,22 +617,21 @@ async def get_history(limit: int = 50):
 @app.get("/towers")
 async def get_towers():
     """Return tower positions for map overlay."""
-    f = Path(__file__).parent.parent / "data" / "towers.json"
-    if not f.exists():
+    if not TOWERS_PATH.exists():
         return []
-    return json.loads(f.read_text())
+    return json.loads(TOWERS_PATH.read_text())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # WEBSOCKET ENDPOINT
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 
 @app.websocket("/ws/simulation")
 async def ws_simulation(ws: WebSocket):
     """
     Real-time simulation stream.
-    Frames are broadcast by the simulation task; this handler only receives
-    client‑side injected notifications.
+    Client connects → receives JSON frames at simulation tick rate.
+    Client can also send: {"type": "notify", "message": "...", "priority": 3}
     """
     await ws.accept()
     sim.connected_ws.append(ws)
@@ -603,72 +639,74 @@ async def ws_simulation(ws: WebSocket):
 
     try:
         while True:
-            data = await ws.receive_text()
-            msg = json.loads(data)
-            if msg.get("type") == "notify":
-                sim.injected_notifs.append({
-                    "id": str(uuid.uuid4())[:8],
-                    "message": msg.get("message", "Client notification"),
-                    "priority": msg.get("priority", 5),
-                })
+            # Receive any client messages (non-blocking)
+            try:
+                data = await asyncio.wait_for(ws.receive_text(), timeout=0.05)
+                msg  = json.loads(data)
+                if msg.get("type") == "notify":
+                    manager.add(
+                        msg.get("message", "Client notification"),
+                        priority=int(msg.get("priority", 5)),
+                    )
+            except asyncio.TimeoutError:
+                pass
+
+            # Push latest frame if available
+            if sim.latest_frame:
+                await ws.send_text(json.dumps(sim.latest_frame))
+
+            await asyncio.sleep(0.1)
+
     except WebSocketDisconnect:
-        if ws in sim.connected_ws:
-            sim.connected_ws.remove(ws)
+        sim.connected_ws.remove(ws)
         print(f"[WS] Client disconnected. Remaining: {len(sim.connected_ws)}")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # BACKGROUND SIMULATION TASK
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 
-async def _run_sim_task(session_id: str, route: str, speed_factor: float, notif_rate: float):
-    """Runs the simulation and pushes frames to all connected WS clients."""
-    print(f"[Task] Simulation starting: {route} (session={session_id})")
+async def _run_sim_task(route: str, speed_factor: float, notif_rate: float):
+    """
+    Run a local CSV-backed simulation and score notifications with the ML predictor.
+    """
+    print(f"[Task] Simulation starting: {route}")
     try:
         init_db()
-        ensure_db_tables()
+        rows = _load_dataset_rows(route)
+        tick_seconds = max(0.05, 1.0 / max(float(speed_factor), 1.0))
 
-        # Log run start
-        try:
-            conn = sqlite3.connect(str(DB_PATH))
-            conn.execute(
-                "INSERT INTO runs(start_time, session_id) VALUES (?, ?)",
-                (datetime.utcnow().isoformat(timespec="seconds") + "Z", session_id)
-            )
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-
-        # Instantiate predictor (DecisionEngine)
-        engine = None
-        try:
-            engine = DecisionEngine(EngineConfig())
-        except Exception:
-            engine = None
-
-        async for frame in run_simulation(route, speed_factor, notif_rate=notif_rate):
+        for idx, base_row in enumerate(rows):
             if not sim.running:
                 print("[Task] Simulation stopped by user.")
                 break
 
-            frame["session_id"] = session_id
+            frame = dict(base_row)
+            frame["t"] = int(frame.get("t", idx) or idx)
+            frame.setdefault("events", [])
+            if predictor is not None:
+                try:
+                    frame["prediction"] = predictor.predict(frame)
+                except Exception:
+                    frame["prediction"] = None
+            else:
+                frame["prediction"] = None
 
-            # Move injected notifications into the manager queue
-            while sim.injected_notifs:
-                n = sim.injected_notifs.pop(0)
-                manager.add(n.get("message", "Injected"), priority=n.get("priority", 5))
-
-            # Evaluate pending notifications with safety & ML
-            delivered = manager.evaluate_pending(frame, predictor=engine)
+            delivered = manager.evaluate_pending(frame, predictor=predictor)
             for d in delivered:
                 frame.setdefault("events", []).append({
                     "notif_id": d.get("id"),
+                    "message": d.get("message"),
                     "decision": d.get("decision"),
                     "wait_sec": 0,
-                    "rssi": frame.get("rssi_filtered"),
-                    "quality": frame.get("quality"),
+                    "rssi": frame.get("rssi_raw", frame.get("rsrp_dbm")),
+                    "quality": frame.get("signal_quality"),
                     "reason": d.get("reason"),
+                    "probability": d.get("probability"),
+                    "decision_threshold": d.get("decision_threshold_used"),
+                    "main_model_prob": d.get("main_model_prob"),
+                    "backup_model_prob": d.get("backup_model_prob"),
+                    "legacy_model_prob": d.get("legacy_model_prob"),
                     "distraction_risk": d.get("distraction_risk"),
                     "acceleration": d.get("acceleration"),
                     "minimal_ui": d.get("minimal_ui"),
@@ -684,25 +722,21 @@ async def _run_sim_task(session_id: str, route: str, speed_factor: float, notif_
                 except Exception:
                     dead.append(ws)
             for ws in dead:
-                if ws in sim.connected_ws:
-                    sim.connected_ws.remove(ws)
+                sim.connected_ws.remove(ws)
+            await asyncio.sleep(tick_seconds)
 
-    except asyncio.CancelledError:
-        print("[Task] Simulation task cancelled.")
     except Exception as e:
         print(f"[Task] Simulation error: {e}")
         import traceback
         traceback.print_exc()
     finally:
         sim.running = False
-        if sim.task and sim.task is asyncio.current_task():
-            sim.task = None
         print("[Task] Simulation ended.")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 # STARTUP
-# ═════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
 
 @app.on_event("startup")
 async def on_startup():
@@ -714,4 +748,4 @@ async def on_startup():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
