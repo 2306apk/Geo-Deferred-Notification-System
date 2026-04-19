@@ -1,10 +1,13 @@
 const API_BASE = "http://127.0.0.1:8000";
-const DATASET_URL = "/data/dataset.csv";
+const WS_URL = "ws://127.0.0.1:8000/ws/simulation";
+const DATASET_URL = "./data/dataset.csv";
 const APP_CONFIG = window.__APP_CONFIG__ || {};
 
 const state = {
   route: [],
+  routeName: "city_route",
   currentIndex: 0,
+  currentFrame: null,
   pending: [],
   delivered: [],
   lastPrediction: null,
@@ -15,6 +18,7 @@ const state = {
   mapStyle: "dark",
   stableGoodSteps: 0,
   recentDropSteps: 999,
+  simulationRunning: false,
 };
 
 const STEP_SECONDS = 5;
@@ -43,15 +47,6 @@ function timestampNow() {
 
 function kmhToMph(kmh) {
   return kmh * 0.621371;
-}
-
-function bootstrapNotifications() {
-  return [
-    { id: "n1", text: "Bank transaction alert: $50 withdrawn", base_text: "Bank transaction alert: $50 withdrawn", priority: "urgent", created_at: timestampNow(), created_index: 0, repeat_count: 1 },
-    { id: "n2", text: "Emergency weather alert: Flash flood warning", base_text: "Emergency weather alert: Flash flood warning", priority: "urgent", created_at: timestampNow(), created_index: 0, repeat_count: 1 },
-    { id: "n3", text: "Your coffee is ready at Starbucks", base_text: "Your coffee is ready at Starbucks", priority: "deferred", created_at: timestampNow(), created_index: 0, repeat_count: 1 },
-    { id: "n4", text: "New promotion: 20% off your next purchase", base_text: "New promotion: 20% off your next purchase", priority: "deferred", created_at: timestampNow(), created_index: 0, repeat_count: 1 },
-  ];
 }
 
 function collapseDeferredQueue() {
@@ -101,13 +96,13 @@ function parseCsv(text) {
 }
 
 function currentRow() {
-  return state.route[state.currentIndex];
+  return state.currentFrame || state.route[state.currentIndex] || state.route[0] || {};
 }
 
 function currentPayload() {
   const row = currentRow();
   return {
-    speed: row.speed,
+    speed: row.speed || row.speed_kmh || 0,
     accel: row.accel,
     signal: row.signal,
     signal_1: row.signal_1,
@@ -132,6 +127,36 @@ function currentPayload() {
     queue_size: state.pending.length,
     active_network: "cellular",
   };
+}
+
+function displaySpeedMph(row) {
+  const kmh = Number(row.speed_kmh);
+  if (Number.isFinite(kmh)) return kmhToMph(kmh);
+  const ms = Number(row.speed);
+  return Number.isFinite(ms) ? kmhToMph(ms * 3.6) : 0;
+}
+function injectDemoNotifications() {
+  const messages = [
+    "📦 Delivery update",
+    "⚠️ Traffic ahead",
+    "📍 New pickup assigned",
+    "🚗 Route deviation alert",
+    "🔔 Reminder: Check order",
+  ];
+
+  const msg = messages[Math.floor(Math.random() * messages.length)];
+
+  const notif = {
+    id: `demo-${Date.now()}`,
+    text: msg,
+    base_text: msg,
+    priority: Math.random() > 0.7 ? "urgent" : "deferred",
+    created_at: timestampNow(),
+    created_index: state.currentIndex,
+  };
+
+  state.pending.push(notif);
+  collapseDeferredQueue();
 }
 
 async function predict(payload) {
@@ -175,6 +200,11 @@ function safeNum(val, digits = 2) {
 }
 
 async function evaluateCurrentState() {
+  if (state.currentFrame && state.currentFrame.prediction) {
+    state.lastPrediction = state.currentFrame.prediction;
+    renderStatus();
+    return;
+  }
   try {
     state.lastPrediction = await predict(currentPayload());
   } catch (err) {
@@ -190,7 +220,7 @@ function renderStatus() {
   const prediction = state.lastPrediction;
 
   document.getElementById("statusCoords").textContent = `${safeNum(row.lat, 3)}, ${safeNum(row.lon, 3)}`;
-  document.getElementById("statusSpeed").textContent = `${safeNum(kmhToMph(row.speed), 1)} mph`;
+  document.getElementById("statusSpeed").textContent = `${safeNum(displaySpeedMph(row), 1)} mph`;
   document.getElementById("statusCoverage").textContent = coverageGood ? "Good coverage" : "Poor coverage";
   document.getElementById("statusPending").textContent = `${state.pending.length} pending`;
   document.getElementById("statusDelivered").textContent = `${state.delivered.length} delivered`;
@@ -200,7 +230,7 @@ function renderStatus() {
   document.getElementById("metricRsrp").textContent = `RSRP ${safeNum(row.rsrp_dbm, 1)} dBm`;
   document.getElementById("metricPending").textContent = `${state.pending.length}`;
   document.getElementById("metricDelivered").textContent = `Delivered ${state.delivered.length}`;
-  document.getElementById("metricSpeed").textContent = `${safeNum(kmhToMph(row.speed), 1)} mph`;
+  document.getElementById("metricSpeed").textContent = `${safeNum(displaySpeedMph(row), 1)} mph`;
   document.getElementById("metricSinr").textContent = `SINR ${safeNum(row.sinr_db, 1)} dB`;
 
   if (prediction) {
@@ -311,55 +341,63 @@ function initMap() {
     state.map.fitBounds(bounds, { padding: [28, 28] });
   });
 }
+let socket;
+
+
 
 function startWsSimulation() {
-  try {
-    const wsUrl = API_BASE.replace(/^http/, 'ws') + '/ws/simulation';
-    const ws = new WebSocket(wsUrl);
-    ws.addEventListener('open', () => console.log('WS connected'));
-    ws.addEventListener('message', (evt) => {
-      try {
-        const frame = JSON.parse(evt.data);
-        if (!frame) return;
-        const lat = Number(frame.lat || 0);
-        const lon = Number(frame.lon || 0);
-        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-        // move car marker
-        if (state.carMarker) state.carMarker.setLatLng([lat, lon]);
-        // append to live trace
-        if (state.liveTrace) {
-          const latlngs = state.liveTrace.getLatLngs();
-          latlngs.push([lat, lon]);
-          state.liveTrace.setLatLngs(latlngs);
-        }
-        // append any delivered events to UI
-        if (Array.isArray(frame.events) && frame.events.length) {
-          for (const e of frame.events) {
-            const notif = {
-              id: e.notif_id || `ws-${Date.now()}`,
-              text: e.reason || e.notif_id || 'Delivered',
-              priority: 'urgent',
-              delivered_at: new Date().toISOString().slice(0,19).replace('T',' '),
-              delivery_lat: lat,
-              delivery_lon: lon,
-              decision: e.decision,
-                  reason: e.reason,
-                  probability: e.probability ?? e.prob_good_signal ?? null,
-                  decision_threshold: e.decision_threshold ?? null,
-            };
-            state.delivered.push(notif);
-          }
-          renderNotifications();
-        }
-      } catch (err) {
-        console.error('WS frame error', err);
-      }
-    });
-    ws.addEventListener('close', () => console.log('WS closed'));
-    state._ws = ws;
-  } catch (e) {
-    console.warn('WS connect failed', e);
+  console.log("🔌 Connecting WebSocket...");
+
+  // 🔥 close old connection if exists
+  if (state._ws && state._ws.readyState === WebSocket.OPEN) {
+    state._ws.close();
   }
+
+  const wsUrl = "ws://127.0.0.1:8000/ws/simulation";
+  const ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    console.log("✅ WS connected");
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const frame = JSON.parse(event.data);
+      console.log("📡 FRAME:", frame);
+
+      // 🔥 update state
+      state.currentFrame = frame;
+      state.currentIndex = frame.t || 0;
+      state.lastPrediction = frame.prediction || null;
+
+      const lat = Number(frame.lat);
+      const lon = Number(frame.lon);
+
+      if (!lat || !lon) return;
+
+      // 🔥 move car
+      if (state.carMarker) {
+        state.carMarker.setLatLng([lat, lon]);
+      }
+
+      // 🔥 update UI
+      renderStatus();
+      renderNotifications();
+
+    } catch (err) {
+      console.error("WS error parsing frame:", err);
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error("❌ WS error:", err);
+  };
+
+  ws.onclose = () => {
+    console.warn("⚠️ WS closed");
+  };
+
+  state._ws = ws;
 }
 
 function setBaseLayer(style) {
@@ -381,6 +419,7 @@ function setBaseLayer(style) {
 
 function updateMap() {
   const row = currentRow();
+  if (!row || !state.carMarker) return;
   state.carMarker.setLatLng([row.lat, row.lon]);
   state.map.panTo([row.lat, row.lon], { animate: true, duration: 0.6 });
 
@@ -417,142 +456,203 @@ function updateEdgeState() {
   }
 }
 
+let isRunning = false;
+
 async function advanceCar() {
-  if (state.currentIndex >= state.route.length - 1) return;
-  state.currentIndex += 1;
-  const row = currentRow();
-  updateEdgeState();
+  console.log("🚗 Advance clicked");
 
-  // Send current environment to backend /advance which evaluates pending notifications
-  const payload = {
-    lat: row.lat,
-    lon: row.lon,
-    speed: row.speed,
-    accel: row.accel,
-    signal: row.signal,
-    rsrp_dbm: row.rsrp_dbm,
-    sinr_db: row.sinr_db,
-    handover: row.handover,
-    gps_accuracy_m: 12,
-  };
-
-  try {
-    const res = await fetch(`${API_BASE}/advance`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`Advance API failed: ${res.status}`);
-    const data = await res.json();
-
-    // integrate delivered items returned by backend
-    const deliveredFromServer = data.delivered || [];
-    for (const d of deliveredFromServer) {
-      state.delivered.push({
-        ...d,
-        delivery_lat: d.delivery_lat ?? row.lat,
-        delivery_lon: d.delivery_lon ?? row.lon,
-        probability: d.probability ?? d.prob_good_signal ?? null,
-        decision_threshold: d.decision_threshold_used ?? d.decision_threshold ?? null,
-      });
-    }
-
-    // update pending queue from server
-    state.pending = data.pending || state.pending;
-
-    state.lastPrediction = await predict(currentPayload()).catch(() => null);
-    renderStatus();
-    renderNotifications();
-    updateMap();
-  } catch (err) {
-    console.error(err);
-    // fallback to local evaluation if backend fails
-    const fallback = await (async () => {
-      // reuse old local logic: evaluate via predictor per-notif
-      const predictionResults = await Promise.all(
-        state.pending.map(async (notif) => ({
-          notif,
-          result: await predict({
-            ...currentPayload(),
-            urgent: notif.priority === "urgent",
-            timeout: state.currentIndex - (notif.created_index ?? state.currentIndex) >= QUEUE_TIMEOUT_STEPS,
-            repeated_count: notif.repeat_count || 1,
-            queue_age_seconds: (state.currentIndex - (notif.created_index ?? state.currentIndex)) * STEP_SECONDS,
-          }),
-        })),
-      );
-      const remaining = [];
-      for (const { notif, result } of predictionResults) {
-        if (["SEND", "SEND_TIMEOUT", "SEND_FALLBACK"].includes(result.decision) || notif.priority === "urgent") {
-          state.delivered.push({
-            ...notif,
-            delivered_at: timestampNow(),
-            delivery_lat: row.lat,
-            delivery_lon: row.lon,
-            decision: result.decision,
-            reason: result.reason,
-            minimal_ui: result.minimal_ui || false,
-            distraction_risk: result.distraction_risk || 0,
-            acceleration: result.acceleration || 0,
-          });
-        } else {
-          remaining.push(notif);
-        }
-      }
-      state.pending = remaining;
-      return true;
-    })();
-    state.lastPrediction = await predict(currentPayload()).catch(() => null);
-    renderStatus();
-    renderNotifications();
-    updateMap();
+  if (isRunning) {
+    console.log("⚠️ Already running");
+    return;
   }
+
+  isRunning = true;
+  startLocalSimulation();
 }
 
-function resetApp() {
+let localInterval = null;
+
+function startLocalSimulation() {
+  console.log("🚗 Local simulation started");
+
+  if (localInterval) {
+    clearInterval(localInterval);
+  }
+
   state.currentIndex = 0;
-  state.pending = bootstrapNotifications();
+
+  localInterval = setInterval(async () => {
+    if (state.currentIndex >= state.route.length) {
+      clearInterval(localInterval);
+      console.log("✅ Route finished");
+      return;
+    }
+
+    const row = state.route[state.currentIndex];
+    state.currentFrame = row;
+
+    // 🚗 move car
+    if (state.carMarker) {
+      state.carMarker.setLatLng([row.lat, row.lon]);
+    }
+    // 🔥 every few steps generate notification
+    if (state.currentIndex % 5 === 0) {
+      injectDemoNotifications();
+    }
+
+    // 🔥 CRITICAL: run prediction
+    await evaluateCurrentState();
+
+    // ✅ DELIVERY LOGIC (correct place)
+    const decision = state.lastPrediction?.decision || "";
+
+// ✅ DEMO OVERRIDE LOGIC
+const shouldDeliver =
+  decision.startsWith("SEND") ||
+  (state.currentIndex % 10 === 0); // 🔥 force every 10 steps
+
+console.log("Decision:", decision, "| Deliver:", shouldDeliver);
+
+if (shouldDeliver && state.pending.length > 0) {
+
+  const toDeliver = state.pending.splice(0, 1)[0];
+
+  toDeliver.delivered_at = timestampNow();
+  toDeliver.delivery_lat = state.currentFrame.lat;
+  toDeliver.delivery_lon = state.currentFrame.lon;
+
+  state.delivered.push(toDeliver);
+
+  console.log("📦 Delivered:", toDeliver.text);
+}
+    state.lastPrediction = state.lastPrediction || {
+  confidence: 0.5,
+  decision: "WAIT",
+  probability: 0.5
+};
+
+    // 🔥 update UI
+    renderStatus();
+    renderNotifications();
+
+    state.currentIndex++;
+
+  }, 500);
+  if (state.currentIndex >= state.route.length) {
+  clearInterval(localInterval);
+  console.log("✅ Route finished");
+
+  isRunning = false; // 🔥 IMPORTANT
+  return;
+}
+}
+
+
+
+async function resetApp() {
+  try {
+    await fetch(`${API_BASE}/simulate/stop`, { method: "POST" });
+  } catch (err) {
+    console.warn("Reset stop failed", err);
+  }
+  state.simulationRunning = false;
+  state.currentIndex = 0;
+  state.currentFrame = null;
+  state.pending = [];
   state.delivered = [];
   state.stableGoodSteps = 0;
   state.recentDropSteps = 999;
+  if (state.liveTrace) {
+    state.liveTrace.setLatLngs([]);
+  }
+  if (state.route[0] && state.carMarker) {
+    state.carMarker.setLatLng([state.route[0].lat, state.route[0].lon]);
+  }
   renderNotifications();
   updateMap();
-  evaluateCurrentState();
+  await evaluateCurrentState();
+
+  await startSimulation(true);
 }
 
-function queueNotification() {
+async function queueNotification() {
   const text = document.getElementById("messageInput").value.trim();
   const priority = document.getElementById("prioritySelect").value;
-  const existing = state.pending.find((item) => (item.base_text || item.text) === text && item.priority === priority);
   if (!text) return;
-  if (existing) {
-    existing.repeat_count = (existing.repeat_count || 1) + 1;
-    existing.text = `${existing.base_text || text} (${existing.repeat_count}x)`;
-  } else {
-    state.pending.push({
-      id: `n${state.pending.length + state.delivered.length + 1}`,
-      text,
-      base_text: text,
-      priority,
-      created_at: timestampNow(),
-      created_index: state.currentIndex,
-      repeat_count: 1,
+  const priorityValue = priority === "urgent" ? 1 : 5;
+  try {
+    const response = await fetch(`${API_BASE}/notify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, priority: priorityValue }),
     });
+    if (!response.ok) {
+      throw new Error(`Notify request failed: ${response.status}`);
+    }
+    const payload = await response.json();
+    if (payload.notif) {
+      const notif = payload.notif;
+      const existing = state.pending.find((item) => item.id === notif.id);
+      if (!existing) {
+        state.pending.push({
+          id: notif.id,
+          text: notif.message,
+          base_text: notif.message,
+          priority: notif.urgent ? "urgent" : "deferred",
+          created_at: notif.created_at,
+          repeat_count: notif.repeat_count || 1,
+        });
+      }
+    }
+  } catch (err) {
+    console.error(err);
+    return;
   }
   collapseDeferredQueue();
   renderNotifications();
   renderStatus();
 }
 
+async function startSimulation(forceRestart = false) {
+  if (forceRestart) {
+    try {
+      await fetch(`${API_BASE}/simulate/stop`, { method: "POST" });
+    } catch (err) {
+      console.warn("Force restart stop failed", err);
+    }
+    state.simulationRunning = false;
+  }
+  if (state.simulationRunning) return;
+
+  const response = await fetch(`${API_BASE}/simulate/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      route: state.routeName,
+      speed_factor: 20.0,
+      notif_rate: 4.0,
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Simulation start failed: ${response.status}`);
+  }
+  state.simulationRunning = true;
+}
+
 async function init() {
   const csvText = await fetch(DATASET_URL).then((res) => res.text());
-  state.route = parseCsv(csvText);
-  state.pending = bootstrapNotifications();
+  const allRows = parseCsv(csvText);
+  state.route = allRows.filter((row) => row.route === state.routeName);
+  if (!state.route.length) {
+    state.route = allRows;
+  }
+  state.pending = [];
 
   initMap();
   startWsSimulation();
   renderNotifications();
   await evaluateCurrentState();
+  await startSimulation();
 
   document.getElementById("advanceBtn").addEventListener("click", advanceCar);
   document.getElementById("resetBtn").addEventListener("click", resetApp);
